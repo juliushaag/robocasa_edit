@@ -27,6 +27,9 @@ MAX_DISTRACTION_OBJECTS = 12
 # Render every rollout, will be slower 
 RENDER = True
 
+# maximum number of trajectories to edit (for testing purposes)
+MAX_TRAJ = 5
+
 
 def set_state_from_flattened(state, recorded_joints):
     idx_qpos = 1
@@ -238,7 +241,7 @@ if __name__ == "__main__":
   distr_objs = [elem for elem in distr_objs_path.glob("**/**/*.xml")]
 
   # run every demo in the dataset
-  for ep in tqdm(demos[:4]):
+  for ep in tqdm(demos[:MAX_TRAJ]):
     states = dataset_file["data/{}/states".format(ep)]
     
     xml_string = update_xml(dataset_file["data/{}".format(ep)].attrs["model_file"])  
