@@ -1,0 +1,251 @@
+import mujoco as mj
+import mujoco.viewer
+import h5py
+from pathlib import Path
+import numpy as np
+import time as timer
+from xml.etree import ElementTree as ET
+from scipy.spatial.transform import Rotation as  R
+from tqdm import tqdm
+
+# requires mujoco > 3.2, scikit-learn, h5py, tqdm and numpy therefore ROBOSUITE and ROBOCASA cant be installed in the same environment
+# just point the following path to the respective directories where the libraries are installed
+
+# Path to the robosuite and robocasa directories
+ROBOSUITE_PATH = Path("/Users/lovelace/Dev/rc/robosuite/robosuite")
+ROBOCASA_PATH = Path("/Users/lovelace/Dev/rc/robocasa/robocasa")
+
+# Which dataset to manipulate
+SOURCE_PATH = ROBOCASA_PATH / "../datasets/v0.1/single_stage/kitchen_drawer/CloseDrawer/2024-04-30/demo_gentex_im128_randcams.hdf5"
+
+# Where to save the altered dataset
+OUTPUT_PATH = "new_dataset.hdf5"
+
+# How many objects to spawn at max, every scene will contain 1 - MAC_DISTRACTION_OBJECTS objects
+MAX_DISTRACTION_OBJECTS = 12
+
+# Render every rollout, will be slower 
+RENDER = True
+
+
+def set_state_from_flattened(state, recorded_joints):
+    idx_qpos = 1
+    idx_qvel = idx_qpos + recorded_joints
+
+    time = state[0]
+    qpos = state[idx_qpos:idx_qpos + recorded_joints]
+    qvel = state[idx_qvel:idx_qvel + recorded_joints]
+    
+    return time, qpos, qvel
+
+
+def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 32, max_geoms = 32, render = False):
+
+  np.random.seed(seed)
+
+  spec = mj.MjSpec.from_string(xml_string)
+
+  parents = { child : parent for parent in spec.bodies for child in parent.bodies }
+  obj = next(body for body in spec.bodies if any(jnt.type == mj.mjtJoint.mjJNT_FREE for jnt in body.joints) and body.name.startswith("distr_counter"))
+
+
+  parent = parents[obj]
+  ndistr_objs = np.random.randint(1, max_geoms)
+
+  for i in range(ndistr_objs):
+    file = distr_objs[np.random.randint(0, len(distr_objs))]
+   
+    # this is a mitigation for the misconfiguration that mujoco searches for the assets in the meshes/ subfolder, which is enabled on default
+    obj_string = file.read_text()
+    root = ET.fromstring(obj_string)
+    asset = root.find("asset")
+    meshes = asset.findall("mesh")
+    textures = asset.findall("texture")
+
+
+    for elem in meshes + textures:
+      old_path = elem.get("file")
+      elem.set("file", str(file.parent / old_path))
+
+
+    obj_string = ET.tostring(root).decode("utf8") 
+    obj_spec = mj.MjSpec.from_string(obj_string)
+
+
+    frame = parent.add_frame()
+
+    # body = frame.attach_body(obj_spec.worldbody.bodies[0].bodies[0], f"added_obj{i}", '')
+    body = frame.attach_body(obj, f"added_obj{i}", '')
+
+    body.name = "added_obj{}".format(i)
+  
+  model = spec.compile()
+
+  xml_string = spec.to_xml()
+
+  
+  # newly added freejoints are always last (i assume) TODO put an assert here
+  data = mj.MjData(model)
+  recorded_joints = model.nq - 7 * ndistr_objs # pos and quat for every freejoint added 
+  
+  # set initial state for distr objects
+  time, qpos, qvel = set_state_from_flattened(states[0], recorded_joints)
+
+  model_distr_joint = model.joint(model.body(obj.name).jntadr.item())
+  root_pos = qpos[model_distr_joint.qposadr.item():model_distr_joint.qposadr.item() + 3]
+
+
+  spawn_height = root_pos[2]
+  floor = model.body("floor_room_main")
+  spawn_bbos = model.geom(floor.geomadr.item()).size
+
+  forward = np.array([-spawn_bbos[0], 0, 0])
+  right = np.array([0, -spawn_bbos[1], 0])
+
+  transform = R.from_quat(floor.quat, scalar_first=True)
+
+  forward = transform.apply(forward) 
+  right = transform.apply(right)
+
+  min_pos = floor.pos - forward - right
+  max_pos = floor.pos + forward + right
+
+  dia = max_pos - min_pos
+
+  # make the area a bit smaller to avoid objects being spawned in the walls or too close to the edge
+  min_pos += 0.1 * dia
+  max_pos -= 0.1 * dia
+
+  forward = np.array([max_pos[0] - min_pos[0], 0, 0])
+  right = np.array([0, max_pos[1] - min_pos[1], 0])
+
+  # spawn objects at the height of the distr obj already contained and in the area of the floor
+  for i in range(ndistr_objs):
+    joint = model.jnt(model.body("added_obj{}".format(i)).jntadr.item())
+    
+    x, y = np.random.rand(2)
+
+    x = min_pos + x * forward
+    y = min_pos + y * right
+
+    data.qpos[joint.qposadr.item(): joint.qposadr.item() + 3] = x + y + np.array([0, 0, spawn_height])
+    data.qpos[joint.qposadr.item() + 3: joint.qposadr.item() + 7] = R.from_euler("xyz", [*np.random.randn(2), 0]).as_quat()  
+
+  with open("new.xml", "w") as f:
+    f.write(xml_string)
+ 
+  # let the simulation run for a while to let the objects fall to the ground
+  mj.mj_step(model, data, 2000)
+
+
+  new_states = np.zeros((len(states), 1 + len(data.qpos) + len(data.qvel)))
+  
+  if render:
+    viewer = mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False)
+      
+    # disable collision geom rendering
+    viewer.opt.geomgroup[0] = 0
+    viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = 0
+
+    viewer.cam.lookat = [2.5, 0, 1]
+    viewer.cam.distance = 5
+    viewer.cam.azimuth = 90
+    viewer.cam.elevation = -10
+
+  for i, state in enumerate(states):
+    start = timer.time()
+
+    time, qpos, qvel = set_state_from_flattened(state, recorded_joints)
+
+    data.time = time
+    data.qpos[:len(qpos)] = qpos
+    data.qvel[:len(qvel)] = qvel
+
+    # save new states
+    new_states[i, :] = np.concat([np.array([data.time]), data.qpos, data.qvel])
+  
+    mj.mj_step(model, data)
+
+    if render: 
+      viewer.sync()
+      elapsed = timer.time() - start
+      diff = 1 / 30 - elapsed
+      if diff > 0:
+        timer.sleep(diff)
+
+  if render:
+    viewer.close()
+
+  return xml_string, new_states
+    
+def update_xml(xml_string) -> str:
+  root = ET.fromstring(xml_string)
+
+  asset = root.find("asset")
+  meshes = asset.findall("mesh")
+  textures = asset.findall("texture")
+  
+  all_assets = meshes + textures
+
+  for elem in all_assets:
+      old_path = elem.get("file")
+      if old_path is None: continue
+
+      old_path_split = Path(old_path).parts
+
+      if "robosuite" in old_path_split:        
+          ind = old_path_split.index("robosuite")
+          
+          new_path_split =  old_path_split[ind + 1:]
+          new_path = "/".join(new_path_split)
+          elem.set("file", str(ROBOSUITE_PATH / new_path))
+
+      elif "robocasa" in old_path_split:
+          ind = 0
+          for i, p in enumerate(old_path_split):
+              if p == "robocasa": ind = i # last occurence of robocasa
+
+          new_path_split = old_path_split[ind + 1:]
+          new_path = "/".join(new_path_split)
+          elem.set("file", str(ROBOCASA_PATH / new_path))
+
+  return ET.tostring(root).decode("utf8")
+
+if __name__ == "__main__":
+
+  # This is the standard dataset path set by robocasa
+  dataset_file = h5py.File(str(SOURCE_PATH), "r")
+  output_file = h5py.File(str(OUTPUT_PATH), "w")
+
+  output_group = output_file.create_group("data")
+
+  for key, value in dict(dataset_file["data"].attrs).items():
+    output_group.attrs[key] = value
+
+  # sort demos
+  demos = sorted(list(dataset_file["data"].keys()), key=lambda x: int(x[5:]))
+
+  # load distraction objects from robocasa
+  distr_objs_path =  ROBOCASA_PATH / "models/assets/objects/objaverse"  
+  distr_objs = [elem for elem in distr_objs_path.glob("**/**/*.xml")]
+
+  # run every demo in the dataset
+  for ep in tqdm(demos[:4]):
+    states = dataset_file["data/{}/states".format(ep)]
+    
+    xml_string = update_xml(dataset_file["data/{}".format(ep)].attrs["model_file"])  
+
+    xml_string, states = run_scene(xml_string, states, distr_objs, max_geoms=MAX_DISTRACTION_OBJECTS, render=RENDER)
+
+    # save the new states
+    ep_group = output_group.create_group(ep)
+    
+    for key, value in  dict(dataset_file["data/{}".format(ep)].attrs).items():
+      ep_group.attrs[key] = value
+
+    ep_group.attrs["model_file"] = xml_string
+
+    ep_group.create_dataset("states", data=states)
+
+  output_file.close()
+  dataset_file.close()
