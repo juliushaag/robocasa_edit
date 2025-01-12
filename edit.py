@@ -74,13 +74,19 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
 
     frame = parent.add_frame()
 
-    # body = frame.attach_body(obj_spec.worldbody.bodies[0].bodies[0], f"added_obj{i}", '')
-    body = frame.attach_body(obj, f"added_obj{i}", '')
+    body = frame.attach_body(obj_spec.worldbody.bodies[0].bodies[0], f"added_obj{i}", '')
+    # body = frame.attach_body(obj, f"added_obj{i}", '')
+    joint = body.add_freejoint()
+    joint.damping = 0.3
+    for geom in body.geoms:
+      geom.friction = np.array([0.7, 0.2, 0.1])
+      geom.solimp = np.array([0.9, 0.95, 0.001, 0.02, 1])
+      geom.density=1000
+      geom.margin=0.002 #  Adding margin for better contact handling
 
     body.name = "added_obj{}".format(i)
   
   model = spec.compile()
-
   xml_string = spec.to_xml()
 
   
@@ -131,11 +137,9 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
     data.qpos[joint.qposadr.item(): joint.qposadr.item() + 3] = x + y + np.array([0, 0, spawn_height])
     data.qpos[joint.qposadr.item() + 3: joint.qposadr.item() + 7] = R.from_euler("xyz", [*np.random.randn(2), 0]).as_quat()  
 
+  data.qvel[:] = 0
   with open("new.xml", "w") as f:
     f.write(xml_string)
- 
-  # let the simulation run for a while to let the objects fall to the ground
-  mj.mj_step(model, data, 2000)
 
 
   new_states = np.zeros((len(states), 1 + len(data.qpos) + len(data.qvel)))
@@ -152,17 +156,21 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
     viewer.cam.azimuth = 90
     viewer.cam.elevation = -10
 
+   
+  # let the simulation run for a while to let the objects fall to the ground
+  mj.mj_step(model, data, 2000)
+
   for i, state in enumerate(states):
     start = timer.time()
 
     time, qpos, qvel = set_state_from_flattened(state, recorded_joints)
 
-    data.time = time
+    data.time = time + data.time
     data.qpos[:len(qpos)] = qpos
     data.qvel[:len(qvel)] = qvel
 
     # save new states
-    new_states[i, :] = np.concat([np.array([data.time]), data.qpos, data.qvel])
+    new_states[i, :] = np.concat([np.array([time]), data.qpos, data.qvel])
   
     mj.mj_step(model, data)
 
