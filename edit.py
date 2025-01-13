@@ -25,7 +25,7 @@ OUTPUT_PATH = "new_dataset.hdf5"
 MAX_DISTRACTION_OBJECTS = 12
 
 # Render every rollout, will be slower 
-RENDER = True
+RENDER = False
 
 # maximum number of trajectories to edit (for testing purposes)
 MAX_TRAJ = 5
@@ -127,7 +127,6 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
 
   forward = np.array([max_pos[0] - min_pos[0], 0, 0])
   right = np.array([0, max_pos[1] - min_pos[1], 0])
-
   # spawn objects at the height of the distr obj already contained and in the area of the floor
   for i in range(ndistr_objs):
     joint = model.jnt(model.body("added_obj{}".format(i)).jntadr.item())
@@ -163,6 +162,14 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
   # let the simulation run for a while to let the objects fall to the ground
   mj.mj_step(model, data, 2000)
 
+
+  distr_obs = np.zeros((len(states), ndistr_objs, 7))
+
+
+  for i in range(ndistr_objs):
+    body = model.body(f"added_obj{i}")
+    distr_obs[:, i, :] = np.concat([data.xpos[body.id], data.xquat[body.id]])
+ 
   for i, state in enumerate(states):
     start = timer.time()
 
@@ -187,7 +194,7 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
   if render:
     viewer.close()
 
-  return xml_string, new_states
+  return xml_string, new_states, distr_obs
     
 def update_xml(xml_string) -> str:
   root = ET.fromstring(xml_string)
@@ -243,10 +250,12 @@ if __name__ == "__main__":
   # run every demo in the dataset
   for ep in tqdm(demos[:MAX_TRAJ]):
     states = dataset_file["data/{}/states".format(ep)]
-    
+    obs = dataset_file["data/{}/obs".format(ep)]
+    print(obs["object"])
+
     xml_string = update_xml(dataset_file["data/{}".format(ep)].attrs["model_file"])  
 
-    xml_string, states = run_scene(xml_string, states, distr_objs, max_geoms=MAX_DISTRACTION_OBJECTS, render=RENDER)
+    xml_string, states, distr_obs = run_scene(xml_string, states, distr_objs, max_geoms=MAX_DISTRACTION_OBJECTS, render=RENDER)
 
     # save the new states
     ep_group = output_group.create_group(ep)
@@ -257,6 +266,18 @@ if __name__ == "__main__":
     ep_group.attrs["model_file"] = xml_string
 
     ep_group.create_dataset("states", data=states)
+
+
+    ep_group.create_dataset("obs", data=np.concatenate([obs["object"], distr_obs.reshape((len(obs["object"]), -1))], axis=1))
+    ep_group.create_dataset("actions", data=dataset_file["data/{}/actions".format(ep)])
+    ep_group.create_dataset("rewards", data=dataset_file["data/{}/rewards".format(ep)])
+    ep_group.create_dataset("dones", data=dataset_file["data/{}/dones".format(ep)])
+    ep_group.create_dataset("actions_abs", data=dataset_file["data/{}/actions_abs".format(ep)])
+
+    action_dict = ep_group.create_group("action_dict")
+
+    for key, value in dict(dataset_file[f"data/{ep}/action_dict"].attrs).items():
+      action_dict.attrs[key] = value
 
   output_file.close()
   dataset_file.close()
