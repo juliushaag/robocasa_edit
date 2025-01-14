@@ -29,7 +29,7 @@ MAX_DISTRACTION_OBJECTS = 12
 RENDER = False
 
 # maximum number of trajectories to edit (for testing purposes)
-MAX_TRAJ = 2
+MAX_TRAJ = None
 
 
 def set_state_from_flattened(state, recorded_joints):
@@ -311,6 +311,11 @@ if __name__ == "__main__":
     for key, value in dict(dataset_file[f"data/{ep}/obs"]).items():
       if key == "object": value=new_obs.reshape(len(new_obs), -1) 
       ep_group.create_dataset("obs/" + key, data=value)
+
+
+    action_dict = ep_group.create_group("action_dict")
+    for key, value in dict(dataset_file[f"data/{ep}/action_dict"].attrs).items():
+      action_dict.attrs[key] = value
 
 
   output_file.close()
