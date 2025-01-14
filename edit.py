@@ -1,3 +1,4 @@
+from copy import deepcopy
 import mujoco as mj
 import mujoco.viewer
 import h5py
@@ -28,7 +29,7 @@ MAX_DISTRACTION_OBJECTS = 12
 RENDER = False
 
 # maximum number of trajectories to edit (for testing purposes)
-MAX_TRAJ = 5
+MAX_TRAJ = 2
 
 
 def set_state_from_flattened(state, recorded_joints):
@@ -42,7 +43,7 @@ def set_state_from_flattened(state, recorded_joints):
     return time, qpos, qvel
 
 
-def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 32, max_geoms = 32, render = False):
+def run_scene(xml_string : str, states : list, observations, distr_objs : list = None, seed = 32, max_geoms = 32, render = False):
 
   np.random.seed(seed)
 
@@ -78,9 +79,10 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
     frame = parent.add_frame()
 
     body = frame.attach_body(obj_spec.worldbody.bodies[0].bodies[0], f"added_obj{i}", '')
-    # body = frame.attach_body(obj, f"added_obj{i}", '')
+
     joint = body.add_freejoint()
     joint.damping = 0.3
+    
     for geom in body.geoms:
       geom.friction = np.array([0.7, 0.2, 0.1])
       geom.solimp = np.array([0.9, 0.95, 0.001, 0.02, 1])
@@ -90,11 +92,11 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
     body.name = "added_obj{}".format(i)
   
   model = spec.compile()
+  data = mj.MjData(model)
   xml_string = spec.to_xml()
 
-  
-  # newly added freejoints are always last (i assume) TODO put an assert here
-  data = mj.MjData(model)
+  objects = [model.body(i) for i in range(model.nbody) if "obj" in model.body(i).name or "distr" in model.body(i).name]
+
   recorded_joints = model.nq - 7 * ndistr_objs # pos and quat for every freejoint added 
   
   # set initial state for distr objects
@@ -127,6 +129,7 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
 
   forward = np.array([max_pos[0] - min_pos[0], 0, 0])
   right = np.array([0, max_pos[1] - min_pos[1], 0])
+
   # spawn objects at the height of the distr obj already contained and in the area of the floor
   for i in range(ndistr_objs):
     joint = model.jnt(model.body("added_obj{}".format(i)).jntadr.item())
@@ -140,10 +143,6 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
     data.qpos[joint.qposadr.item() + 3: joint.qposadr.item() + 7] = R.from_euler("xyz", [*np.random.randn(2), 0]).as_quat()  
 
   data.qvel[:] = 0
-  with open("new.xml", "w") as f:
-    f.write(xml_string)
-
-
   new_states = np.zeros((len(states), 1 + len(data.qpos) + len(data.qvel)))
   
   if render:
@@ -163,12 +162,20 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
   mj.mj_step(model, data, 2000)
 
 
-  distr_obs = np.zeros((len(states), ndistr_objs, 7))
 
+  new_obj_obs = np.zeros((len(states), len(objects), 14))
 
-  for i in range(ndistr_objs):
-    body = model.body(f"added_obj{i}")
-    distr_obs[:, i, :] = np.concat([data.xpos[body.id], data.xquat[body.id]])
+  obj_observations = np.array(observations["object"]).reshape(len(observations["object"]), -1, 14)
+
+  """
+  obs_keys:
+  'object', 
+  'robot0_agentview_left_image', 'robot0_agentview_right_image', 
+  'robot0_base_pos', 'robot0_base_quat', 
+  'robot0_base_to_eef_pos', 'robot0_base_to_eef_quat', 'robot0_eef_pos', 'robot0_eef_quat', 
+  'robot0_eye_in_hand_image', 'robot0_gripper_qpos', 'robot0_gripper_qvel', 
+  'robot0_joint_pos', 'robot0_joint_pos_cos', 'robot0_joint_pos_sin', 'robot0_joint_vel'
+  """
  
   for i, state in enumerate(states):
     start = timer.time()
@@ -181,8 +188,35 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
 
     # save new states
     new_states[i, :] = np.concat([np.array([time]), data.qpos, data.qvel])
-  
+
     mj.mj_step(model, data)
+
+
+    eef_pos, eef_quat = observations["robot0_eef_pos"][i], observations["robot0_eef_quat"][i]
+
+    world_in_eef = np.eye(4)
+    world_in_eef[:3, :3] = R.from_quat(eef_quat).as_matrix().T
+    world_in_eef[:3, 3] = -world_in_eef[:3, :3].dot(eef_pos)
+
+    for k in range(len(objects)):
+      
+      obj_id = objects[k].id
+
+      obj_in_world = np.eye(4)
+      obj_in_world[:3, :3] = data.xmat[obj_id].reshape(3, 3)
+      obj_in_world[:3, 3] = data.xpos[obj_id]
+
+      obj_in_eef = world_in_eef.dot(obj_in_world) 
+
+      new_obj_obs[i, k, :] = np.concatenate([
+        data.xpos[obj_id], 
+        data.xquat[obj_id][[1, 2, 3, 0]], 
+        obj_in_eef[:3, 3], 
+        R.from_matrix(obj_in_eef[:3, :3]).as_quat(canonical=True)]
+      )
+
+    for o, no in zip(obj_observations[i], new_obj_obs[i]): # for assurance that the new observations are correct
+      assert np.allclose(o, no, rtol=1e-2)
 
     if render: 
       viewer.sync()
@@ -194,7 +228,8 @@ def run_scene(xml_string : str, states : list, distr_objs : list = None, seed = 
   if render:
     viewer.close()
 
-  return xml_string, new_states, distr_obs
+
+  return xml_string, new_states, new_obj_obs
     
 def update_xml(xml_string) -> str:
   root = ET.fromstring(xml_string)
@@ -233,12 +268,6 @@ if __name__ == "__main__":
 
   # This is the standard dataset path set by robocasa
   dataset_file = h5py.File(str(SOURCE_PATH), "r")
-  output_file = h5py.File(str(OUTPUT_PATH), "w")
-
-  output_group = output_file.create_group("data")
-
-  for key, value in dict(dataset_file["data"].attrs).items():
-    output_group.attrs[key] = value
 
   # sort demos
   demos = sorted(list(dataset_file["data"].keys()), key=lambda x: int(x[5:]))
@@ -247,15 +276,22 @@ if __name__ == "__main__":
   distr_objs_path =  ROBOCASA_PATH / "models/assets/objects/objaverse"  
   distr_objs = [elem for elem in distr_objs_path.glob("**/**/*.xml")]
 
+  if MAX_TRAJ: demos = demos[:MAX_TRAJ]
+
+
+  output_file = h5py.File(str(OUTPUT_PATH), "w")
+
+  output_group = output_file.create_group("data")
+  for key, value in dict(dataset_file["data"].attrs).items():
+    output_group.attrs[key] = value
+
   # run every demo in the dataset
-  for ep in tqdm(demos[:MAX_TRAJ]):
+  for ep in tqdm(demos):
     states = dataset_file["data/{}/states".format(ep)]
-    obs = dataset_file["data/{}/obs".format(ep)]
-    print(obs["object"])
 
     xml_string = update_xml(dataset_file["data/{}".format(ep)].attrs["model_file"])  
 
-    xml_string, states, distr_obs = run_scene(xml_string, states, distr_objs, max_geoms=MAX_DISTRACTION_OBJECTS, render=RENDER)
+    xml_string, states, new_obs = run_scene(xml_string, states, dataset_file["data"][ep]["obs"], distr_objs, max_geoms=MAX_DISTRACTION_OBJECTS, render=RENDER)
 
     # save the new states
     ep_group = output_group.create_group(ep)
@@ -266,18 +302,16 @@ if __name__ == "__main__":
     ep_group.attrs["model_file"] = xml_string
 
     ep_group.create_dataset("states", data=states)
-
-
-    ep_group.create_dataset("obs", data=np.concatenate([obs["object"], distr_obs.reshape((len(obs["object"]), -1))], axis=1))
     ep_group.create_dataset("actions", data=dataset_file["data/{}/actions".format(ep)])
-    ep_group.create_dataset("rewards", data=dataset_file["data/{}/rewards".format(ep)])
-    ep_group.create_dataset("dones", data=dataset_file["data/{}/dones".format(ep)])
     ep_group.create_dataset("actions_abs", data=dataset_file["data/{}/actions_abs".format(ep)])
 
-    action_dict = ep_group.create_group("action_dict")
+    ep_group.create_dataset("rewards", data=dataset_file["data/{}/rewards".format(ep)])
+    ep_group.create_dataset("dones", data=dataset_file["data/{}/dones".format(ep)])
+    
+    for key, value in dict(dataset_file[f"data/{ep}/obs"]).items():
+      if key == "object": value=new_obs.reshape(len(new_obs), -1) 
+      ep_group.create_dataset("obs/" + key, data=value)
 
-    for key, value in dict(dataset_file[f"data/{ep}/action_dict"].attrs).items():
-      action_dict.attrs[key] = value
 
   output_file.close()
   dataset_file.close()
